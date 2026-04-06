@@ -1,24 +1,39 @@
 import streamlit as st
 import pandas as pd
 
-st.title("🏗️ Monitor de Construcción Perú - Mauro")
-st.sidebar.header("Opciones de Análisis")
+st.set_page_config(page_title="IA Construcción Perú - Mauro", layout="wide")
 
-# Simulación de carga de datos que ya tienes en GitHub
-data = {
-    'Mes': ['Ago 2025', 'Set 2025', 'Nov 2025', 'Mar 2026'],
-    'Acero 3/8"': [30.50, 30.90, 31.40, 32.20],
-    'Cemento I': [26.80, 27.10, 27.50, 28.50]
-}
-df = pd.DataFrame(data)
+st.title("🏗️ Buscador de Inteligencia en Construcción - Mauro")
+st.caption("Analizando: suplementos_tecnicos_extraccion_completa.txt")
 
-st.subheader("📈 Tendencias de Precios")
-material = st.selectbox("Selecciona un material para comparar:", ['Acero 3/8"', 'Cemento I'])
-st.line_chart(df.set_index('Mes')[material])
+# 1. FUNCIÓN PARA LEER TU ARCHIVO TXT
+@st.cache_data
+def cargar_base_conocimiento():
+    try:
+        with open('suplementos_tecnicos_extraccion_completa.txt', 'r', encoding='utf-8') as f:
+            contenido = f.read()
+        return contenido
+    except FileNotFoundError:
+        return "Error: No se encontró el archivo en GitHub. Verifica el nombre."
 
-st.subheader("📰 Noticias y Suplementos Técnicos")
-st.write("Selecciona un mes para ver el análisis de la Revista Costos:")
-mes_seleccionado = st.selectbox("Mes:", ["Marzo 2026", "Noviembre 2025", "Setiembre 2025", "Agosto 2025"])
+base_texto = cargar_base_conocimiento()
 
-if st.button("Ver Resumen de Noticias"):
-    st.info(f"Aquí la IA extraerá las noticias del PDF de {mes_seleccionado}...")
+# 2. BUSCADOR DE INFORMACIÓN
+st.subheader("🔍 Consultar Precios o Noticias")
+query = st.text_input("¿Qué insumo o análisis técnico buscas?", placeholder="Ej: Ladrillo, Cemento Tipo I, Tendencia Acero...")
+
+if query:
+    # Buscamos los párrafos donde aparece lo que el usuario quiere
+    lineas = base_texto.split('\n')
+    resultados = [linea for linea in lineas if query.lower() in linea.lower()]
+    
+    if resultados:
+        st.success(f"Se encontraron {len(resultados)} menciones para '{query}':")
+        for res in resultados[:15]: # Mostramos las primeras 15 coincidencias
+            st.info(res)
+    else:
+        st.warning("No se encontró información específica. Intenta con una palabra más general.")
+
+st.markdown("---")
+st.sidebar.write("### 📂 Archivo de Datos")
+st.sidebar.info("Estás usando la extracción completa de los suplementos 2025-2026.")
