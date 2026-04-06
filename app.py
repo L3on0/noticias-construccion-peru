@@ -1,96 +1,257 @@
-import streamlit as st
-import pandas as pd
 import json
 import os
+import re
+from typing import Any, Dict, List, Optional
 
-st.set_page_config(page_title="IA Presupuestos Perú - Mauro", layout="wide", page_icon="🏗️")
+import pandas as pd
+import streamlit as st
 
-# Estilo para mejorar la lectura en móviles
-st.markdown("""
-    <style>
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
-    .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #f0f2f6; border-radius: 5px; }
-    </style>
-    """, unsafe_allow_html=True)
 
-st.title("🏗️ Sistema Inteligente de Costos y Presupuestos")
-st.caption("Data Maestra: Revista Costos (Agosto 2025 - Marzo 2026)")
+# -----------------------------
+# Configuración general
+# -----------------------------
+st.set_page_config(
+    page_title="Sistema Inteligente de Costos y Presupuestos",
+    page_icon="🏗️",
+    layout="wide",
+)
 
-nombre_json = "suplementos_tecnicos_extraccion_completa.json"
+ARCHIVO_JSON = "suplementos_tecnicos_extraccion_completa.json"
 
-@st.cache_data
-def cargar_base_datos():
-    if os.path.exists(nombre_json):
-        with open(nombre_json, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        df = pd.DataFrame(data)
-        # Limpieza de precios y conversión a número
-        for col in df.columns:
-            if any(x in col for x in ['Precio', 'S/.']):
-                df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '').str.replace('S/.', '').str.strip(), errors='coerce')
-        return df
+
+# -----------------------------
+# Utilidades
+# -----------------------------
+def _to_float(valor: Any) -> Optional[float]:
+    """Convierte strings tipo 'S/. 1,234.50' a float."""
+    if valor is None:
+        return None
+
+    if isinstance(valor, (int, float)):
+        return float(valor)
+
+    texto = str(valor).strip()
+    if not texto:
+        return None
+
+    # Mantener solo dígitos, coma, punto y signo
+    texto = re.sub(r"[^0-9,.\-]", "", texto)
+
+    # Heurísticas para separadores miles/decimal
+    if texto.count(",") > 0 and texto.count(".") > 0:
+        # Si el último separador es punto, asumimos decimal '.'
+        if texto.rfind(".") > texto.rfind(","):
+            texto = texto.replace(",", "")
+        else:
+            texto = texto.replace(".", "").replace(",", ".")
+    else:
+        # Solo coma -> decimal
+        if "," in texto and "." not in texto:
+            texto = texto.replace(",", ".")
+        # Solo punto -> decimal usual, no tocar
+
+    try:
+        return float(texto)
+    except ValueError:
+        return None
+
+
+def _extraer_registros(data: Any) -> Optional[List[Dict[str, Any]]]:
+    """
+    Extrae una lista de diccionarios desde JSON con estructura variable.
+    Soporta:
+    - list[dict]
+    - dict con clave que contenga list[dict]
+    - dict[clave] = dict (se convierte a list(dict.values()))
+    """
+    if isinstance(data, list):
+        if len(data) == 0:
+            return []
+        if all(isinstance(x, dict) for x in data):
+            return data
+        return None
+
+    if isinstance(data, dict):
+        # 1) Buscar clave candidata con list[dict]
+        claves_prioridad = [
+            "data",
+            "registros",
+            "records",
+            "items",
+            "resultados",
+            "suplementos",
+            "detalle",
+            "rows",
+        ]
+
+        for k in claves_prioridad:
+            if k in data and isinstance(data[k], list) and (
+                len(data[k]) == 0 or isinstance(data[k][0], dict)
+            ):
+                return data[k]
+
+        # 2) Buscar automáticamente la primera list[dict]
+        for _, v in data.items():
+            if isinstance(v, list) and (len(v) == 0 or isinstance(v[0], dict)):
+                return v
+
+        # 3) Si es dict de dicts -> convertir valores a lista
+        if all(isinstance(v, dict) for v in data.values()) and len(data) > 0:
+            return list(data.values())
+
     return None
 
-df = cargar_base_datos()
 
-if df is not None:
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🔍 Buscar", "🧱 Materiales", "👷 Mano de Obra", "📈 Curva Histórica", "🧮 Estimador"
-    ])
+def _normalizar_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza columnas de costo/precio y limpia strings vacíos."""
+    # Limpiar strings vacíos
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = df[col].replace(r"^\s*$", pd.NA, regex=True)
 
-    # --- TAB 4: CURVA HISTÓRICA (MEJORADA) ---
-    with tab4:
-        st.subheader("📊 Evolución de Precios")
-        insumo = st.selectbox("Selecciona para analizar tendencia:", df.iloc[:, 0].unique(), key="sb_curva")
-        if insumo:
-            fila = df[df.iloc[:, 0] == insumo].iloc[0]
-            # Identificar columnas de precios y ordenarlas cronológicamente
-            dict_meses = {"Ago": 1, "Set": 2, "Oct": 3, "Nov": 4, "Dic": 5, "Ene": 6, "Feb": 7, "Mar": 8}
-            cols_p = [c for c in fila.index if any(m in c for m in dict_meses.keys())]
-            
-            # Ordenar columnas por el valor del mes
-            cols_p.sort(key=lambda x: next((v for k, v in dict_meses.items() if k in x), 99))
-            
-            precios = fila[cols_p].values
-            meses_labels = [c.split()[-2] + " " + c.split()[-1] for c in cols_p] # Extrae "Marzo 2026" p.ej.
+    # Detectar columnas monetarias por nombre
+    patrones_monto = [
+        "precio",
+        "costo",
+        "importe",
+        "total",
+        "parcial",
+        "s/.",
+        "monto",
+        "valor",
+    ]
 
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                st.write("### 📋 Histórico")
-                df_tab = pd.DataFrame({'Mes': meses_labels, 'Precio S/.': precios})
-                st.dataframe(df_tab, hide_index=True)
-                var = ((precios[-1] - precios[0]) / precios[0]) * 100
-                st.metric("Variación Total", f"{var:.2f}%", delta=f"{var:.2f}%")
-            with c2:
-                st.area_chart(df_tab.set_index('Mes'))
+    for col in df.columns:
+        col_lower = col.lower()
+        if any(p in col_lower for p in patrones_monto):
+            df[col] = df[col].apply(_to_float)
 
-    # --- TAB 5: ESTIMADOR (MEJORADO) ---
-    with tab5:
-        st.subheader("🧮 Cálculo de Presupuesto Rápido")
-        c_e1, c_e2 = st.columns(2)
-        with c_e1:
-            item = st.selectbox("Insumo:", df.iloc[:, 0].unique(), key="sb_est")
-            cant = st.number_input("Cantidad / Metrado:", min_value=0.0, value=1.0)
-        
-        if item:
-            r = df[df.iloc[:, 0] == item].iloc[0]
-            p_actual = r[[c for c in r.index if 'Mar' in c or '2026' in c][0]]
-            und = r.get('Unidad', 'unid')
-            total = cant * p_actual
-            with c_e2:
-                st.metric(label=f"Subtotal (Precio: S/. {p_actual})", value=f"S/. {total:,.2f}")
-                st.write(f"**Partida:** {item}")
-                st.write(f"**Unidad:** {und}")
+    return df
 
-    # (Las demás pestañas mantienen su lógica de búsqueda simple)
-    with tab1:
-        busc = st.text_input("Buscar en todo:")
-        if busc:
-            res = df[df.iloc[:, 0].str.contains(busc, case=False, na=False)]
-            st.dataframe(res)
 
-else:
-    st.error("No se encontró la data JSON.")
+# -----------------------------
+# Carga de datos
+# -----------------------------
+@st.cache_data(show_spinner=True)
+def cargar_base_datos(nombre_json: str) -> Optional[pd.DataFrame]:
+    if not os.path.exists(nombre_json):
+        st.error(f"No se encontró el archivo: {nombre_json}")
+        return None
 
-st.markdown("---")
-st.write("🔧 *Ing. Mauro - Gestión de Costos con IA*")
+    try:
+        with open(nombre_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        st.error(f"JSON inválido: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Error leyendo el archivo: {e}")
+        return None
+
+    registros = _extraer_registros(data)
+    if registros is None:
+        st.error(
+            "No se pudo identificar una estructura tabular en el JSON. "
+            "Debe contener una lista de objetos (dict)."
+        )
+        # Debug amigable
+        st.write("Tipo raíz detectado:", type(data).__name__)
+        if isinstance(data, dict):
+            st.write("Claves raíz:", list(data.keys())[:20])
+        return None
+
+    try:
+        df = pd.json_normalize(registros, sep=".")
+    except Exception as e:
+        st.error(f"No se pudo normalizar el JSON a DataFrame: {e}")
+        return None
+
+    if df.empty:
+        st.warning("El archivo JSON se cargó, pero no contiene registros.")
+        return df
+
+    df = _normalizar_dataframe(df)
+    return df
+
+
+# -----------------------------
+# App principal
+# -----------------------------
+def main():
+    st.title("🏗️ Sistema Inteligente de Costos y Presupuestos")
+    st.caption("Data Maestra: Revista Costos (Agosto 2025 - Marzo 2026)")
+
+    df = cargar_base_datos(ARCHIVO_JSON)
+    if df is None:
+        st.stop()
+
+    if df.empty:
+        st.info("No hay datos para mostrar.")
+        st.stop()
+
+    # Sidebar: búsqueda y columnas
+    st.sidebar.header("Filtros")
+    busqueda = st.sidebar.text_input("Buscar texto (en todas las columnas):").strip()
+
+    columnas = df.columns.tolist()
+    col_mostrar = st.sidebar.multiselect(
+        "Columnas a mostrar:",
+        options=columnas,
+        default=columnas[: min(12, len(columnas))],
+    )
+
+    # Filtro por texto global
+    df_filtrado = df.copy()
+    if busqueda:
+        mask = pd.Series(False, index=df_filtrado.index)
+        for col in df_filtrado.columns:
+            mask = mask | df_filtrado[col].astype(str).str.contains(
+                busqueda, case=False, na=False
+            )
+        df_filtrado = df_filtrado[mask]
+
+    # KPIs
+    st.subheader("Resumen")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Registros", f"{len(df_filtrado):,}")
+    c2.metric("Columnas", f"{len(df_filtrado.columns):,}")
+
+    # Suma de posibles columnas de monto
+    cols_monto = [
+        c
+        for c in df_filtrado.columns
+        if any(x in c.lower() for x in ["precio", "costo", "importe", "total", "monto"])
+        and pd.api.types.is_numeric_dtype(df_filtrado[c])
+    ]
+    total_montos = (
+        float(df_filtrado[cols_monto].sum(numeric_only=True).sum())
+        if cols_monto
+        else 0.0
+    )
+    c3.metric("Suma de montos detectados", f"S/ {total_montos:,.2f}")
+
+    st.divider()
+
+    # Tabla
+    st.subheader("Datos")
+    if col_mostrar:
+        st.dataframe(df_filtrado[col_mostrar], use_container_width=True, height=520)
+    else:
+        st.dataframe(df_filtrado, use_container_width=True, height=520)
+
+    # Descarga CSV
+    csv_bytes = df_filtrado.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Descargar resultado en CSV",
+        data=csv_bytes,
+        file_name="costos_filtrados.csv",
+        mime="text/csv",
+    )
+
+    # Debug opcional
+    with st.expander("Debug (estructura de columnas)"):
+        st.write(df.dtypes.astype(str))
+
+
+if __name__ == "__main__":
+    main()
