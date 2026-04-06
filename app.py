@@ -1,15 +1,16 @@
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 
-# =====================================
-# Configuración
-# =====================================
+# ============================================================
+# CONFIG
+# ============================================================
 st.set_page_config(
     page_title="Sistema Inteligente de Costos y Presupuestos",
     page_icon="🏗️",
@@ -18,155 +19,85 @@ st.set_page_config(
 
 ARCHIVO_JSON = "suplementos_tecnicos_extraccion_completa.json"
 
+# Palabras de ruido para descartar líneas que NO son materiales
+STOPWORDS_RUIDO = [
+    "indice", "índice", "grupo", "capitulo", "capítulo", "precios sin i.g.v",
+    "vigentes al", "tipo de cambio", "factores de reajuste", "área departamento",
+    "cemento - producción", "despacho", "exportación", "resumen", "tabla de contenido",
+]
 
-# =====================================
-# Utilidades
-# =====================================
-def _extraer_texto_recursivo(obj: Any) -> List[str]:
-    """Extrae texto desde estructuras anidadas (dict/list/str)."""
-    textos: List[str] = []
+# Unidades típicas de construcción (expresiones flexibles)
+UNIDAD_REGEX = r"\b(kg|gr|g|tn|ton|t|m2|m3|m|ml|cm|mm|und|unid|u|pza|pieza|bolsa|saco|gal|lt|l)\b"
 
-    if obj is None:
-        return textos
-
-    if isinstance(obj, str):
-        t = obj.strip()
-        if t:
-            textos.append(t)
-        return textos
-
-    if isinstance(obj, (int, float, bool)):
-        return textos
-
-    if isinstance(obj, list):
-        for item in obj:
-            textos.extend(_extraer_texto_recursivo(item))
-        return textos
-
-    if isinstance(obj, dict):
-        # Primero intentamos claves comunes de texto
-        claves_prioridad = [
-            "text", "texto", "content", "contenido", "value",
-            "line", "lines", "paragraph", "paragraphs",
-            "words", "tokens", "raw_text", "page_text",
-            "ocr_text", "message", "description"
-        ]
-        for k in claves_prioridad:
-            if k in obj:
-                textos.extend(_extraer_texto_recursivo(obj[k]))
-
-        # Luego recorremos todo por seguridad
-        for _, v in obj.items():
-            textos.extend(_extraer_texto_recursivo(v))
-
-        return textos
-
-    return textos
+# Patrón de precio monetario
+PRECIO_REGEX = r"(?:S\/\.?\s*)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
 
 
-def _limpiar_y_unir_textos(textos: List[str]) -> str:
-    """Limpia espacios, elimina duplicados y une en un solo texto."""
-    vistos = set()
-    salida = []
-    for t in textos:
-        t2 = re.sub(r"\s+", " ", t).strip()
-        if t2 and t2 not in vistos:
-            vistos.add(t2)
-            salida.append(t2)
-    return " ".join(salida)
+# ============================================================
+# MODELO
+# ============================================================
+@dataclass
+class RegistroMaterial:
+    material: str
+    unidad: Optional[str]
+    precio: float
+    moneda: str
+    file_name: str
+    page_number: Optional[int]
+    fecha_vigencia: Optional[str]
+    linea_origen: str
 
 
-def _extraer_precio_soles(texto: str) -> Optional[float]:
-    """
-    Detecta primer monto tipo:
-    S/ 12.50, S/. 1,250.00, S/12,50, etc.
-    """
-    if not texto:
-        return None
-
-    patron = r"(?:S\/\.?\s*)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
-    m = re.search(patron, texto, flags=re.IGNORECASE)
-    if not m:
-        return None
-
-    raw = m.group(1).strip()
-
-    # Normalización de separadores
-    if "," in raw and "." in raw:
-        # El último separador se asume decimal
-        if raw.rfind(".") > raw.rfind(","):
-            raw = raw.replace(",", "")
-        else:
-            raw = raw.replace(".", "").replace(",", ".")
-    elif "," in raw and "." not in raw:
-        raw = raw.replace(",", ".")
-    # Si solo hay punto, lo dejamos
-
-    try:
-        return float(raw)
-    except ValueError:
-        return None
-
-
+# ============================================================
+# UTILIDADES GENERALES
+# ============================================================
 def _es_lista_dicts(v: Any) -> bool:
     return isinstance(v, list) and (len(v) == 0 or isinstance(v[0], dict))
 
 
-def _buscar_lista_archivos(obj: Any, profundidad: int = 0, max_profundidad: int = 6) -> Optional[List[Dict[str, Any]]]:
+def _buscar_lista_archivos(obj: Any, profundidad: int = 0, max_profundidad: int = 8) -> Optional[List[Dict[str, Any]]]:
     """
-    Busca recursivamente una lista de dicts que represente archivos.
-    Soporta JSON con raíz list o dict anidado.
+    Encuentra la lista principal de archivos en JSON de estructura variable.
     """
     if profundidad > max_profundidad:
         return None
 
-    # Caso directo list[dict]
     if _es_lista_dicts(obj):
         return obj  # type: ignore
 
     if isinstance(obj, dict):
-        # Prioridad a claves típicas
-        claves_prioridad = [
-            "data", "files", "documents", "records", "items",
-            "resultados", "suplementos", "payload", "output"
-        ]
+        claves_prioridad = ["data", "files", "documents", "items", "records", "resultados", "suplementos", "payload"]
         for k in claves_prioridad:
             if k in obj and _es_lista_dicts(obj[k]):
                 return obj[k]  # type: ignore
 
-        # Buscar recursivamente en valores
         for _, v in obj.items():
-            encontrado = _buscar_lista_archivos(v, profundidad + 1, max_profundidad)
-            if encontrado is not None:
-                return encontrado
+            res = _buscar_lista_archivos(v, profundidad + 1, max_profundidad)
+            if res is not None:
+                return res
 
     if isinstance(obj, list):
-        # Si es lista pero no list[dict], buscar dentro
         for item in obj:
-            encontrado = _buscar_lista_archivos(item, profundidad + 1, max_profundidad)
-            if encontrado is not None:
-                return encontrado
+            res = _buscar_lista_archivos(item, profundidad + 1, max_profundidad)
+            if res is not None:
+                return res
 
     return None
 
 
-def _obtener_paginas_desde_archivo(archivo: Dict[str, Any]) -> List[Any]:
+def _obtener_paginas(archivo: Dict[str, Any]) -> List[Any]:
     """
-    Extrae 'pages' desde distintas posibles claves.
+    Detecta lista de páginas con varias llaves posibles.
     """
-    posibles = ["pages", "paginas", "content", "chunks", "sections"]
-    for k in posibles:
+    for k in ["pages", "paginas", "content", "chunks", "sections"]:
         v = archivo.get(k)
         if isinstance(v, list):
             return v
-
-    # fallback: si no existe pages, devolvemos lista vacía
     return []
 
 
 def _obtener_num_pagina(page_obj: Dict[str, Any], fallback: int) -> int:
-    claves = ["page", "page_number", "page_num", "numero_pagina", "nro_pagina", "number", "index"]
-    for k in claves:
+    for k in ["page", "page_number", "page_num", "numero_pagina", "nro_pagina", "number", "index"]:
         v = page_obj.get(k)
         if isinstance(v, int):
             return v
@@ -177,8 +108,205 @@ def _obtener_num_pagina(page_obj: Dict[str, Any], fallback: int) -> int:
     return fallback
 
 
+def _normalizar_numero(txt_num: str) -> Optional[float]:
+    """
+    Convierte números con comas/puntos a float robustamente.
+    """
+    raw = txt_num.strip()
+
+    if "," in raw and "." in raw:
+        # última separación suele ser decimal
+        if raw.rfind(".") > raw.rfind(","):
+            raw = raw.replace(",", "")
+        else:
+            raw = raw.replace(".", "").replace(",", ".")
+    elif "," in raw and "." not in raw:
+        raw = raw.replace(",", ".")
+    # si solo punto, se deja
+
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _extraer_textos(obj: Any) -> List[str]:
+    """
+    Extrae trozos de texto de estructuras anidadas.
+    """
+    out: List[str] = []
+
+    if obj is None:
+        return out
+
+    if isinstance(obj, str):
+        t = obj.strip()
+        if t:
+            out.append(t)
+        return out
+
+    if isinstance(obj, (int, float, bool)):
+        return out
+
+    if isinstance(obj, list):
+        for i in obj:
+            out.extend(_extraer_textos(i))
+        return out
+
+    if isinstance(obj, dict):
+        # priorizar claves textuales típicas OCR
+        for k in [
+            "text", "texto", "content", "contenido", "line", "lines",
+            "paragraph", "paragraphs", "words", "tokens", "raw_text",
+            "ocr_text", "message", "description"
+        ]:
+            if k in obj:
+                out.extend(_extraer_textos(obj[k]))
+
+        # fallback total
+        for _, v in obj.items():
+            out.extend(_extraer_textos(v))
+        return out
+
+    return out
+
+
+def _limpiar_texto(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _split_lineas(textos: List[str]) -> List[str]:
+    """
+    Divide en líneas candidatas.
+    """
+    lineas: List[str] = []
+    for bloque in textos:
+        # primero normaliza saltos
+        partes = re.split(r"[\r\n]+", bloque)
+        for p in partes:
+            p = _limpiar_texto(p)
+            if p:
+                lineas.append(p)
+    return lineas
+
+
+def _es_linea_ruido(linea: str) -> bool:
+    low = linea.lower()
+    if len(linea) < 8:
+        return True
+    for w in STOPWORDS_RUIDO:
+        if w in low:
+            return True
+    return False
+
+
+def _extraer_fecha_vigencia(linea: str) -> Optional[str]:
+    # ej: vigentes al 31/08/2025
+    m = re.search(r"(\d{2}/\d{2}/\d{4})", linea)
+    return m.group(1) if m else None
+
+
+def _detectar_unidad(linea: str) -> Optional[str]:
+    m = re.search(UNIDAD_REGEX, linea, flags=re.IGNORECASE)
+    return m.group(1).lower() if m else None
+
+
+def _extraer_precios_linea(linea: str) -> List[float]:
+    precios: List[float] = []
+    for m in re.finditer(PRECIO_REGEX, linea, flags=re.IGNORECASE):
+        n = _normalizar_numero(m.group(1))
+        if n is not None:
+            precios.append(n)
+    return precios
+
+
+def _extraer_material_de_linea(linea: str) -> str:
+    """
+    Heurística:
+    - quita precios
+    - quita unidades sueltas repetidas
+    - deja texto base del insumo
+    """
+    s = re.sub(PRECIO_REGEX, " ", linea, flags=re.IGNORECASE)
+    s = re.sub(UNIDAD_REGEX, " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b\d+(?:[.,]\d+)?\b", " ", s)  # números sueltos
+    s = re.sub(r"[|;:_\-]{2,}", " ", s)
+    s = _limpiar_texto(s)
+
+    # recortes comunes de encabezados
+    s = re.sub(r"(?i)\bprecios? de (los )?materiales?\b", "", s)
+    s = re.sub(r"(?i)\binsumo\b", "", s)
+    s = _limpiar_texto(s)
+
+    return s.upper()
+
+
+def _linea_es_candidata_material(linea: str) -> bool:
+    if _es_linea_ruido(linea):
+        return False
+
+    # Debe tener al menos un precio y longitud razonable
+    precios = _extraer_precios_linea(linea)
+    if len(precios) == 0:
+        return False
+
+    # Debe contener letras (nombre de material)
+    if not re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", linea):
+        return False
+
+    return True
+
+
+def _parsear_materiales_desde_linea(
+    linea: str,
+    file_name: str,
+    page_number: Optional[int],
+    fecha_ctx: Optional[str]
+) -> List[RegistroMaterial]:
+    """
+    Convierte una línea en 1..n registros de material.
+    Regla actual: toma el ÚLTIMO precio de la línea (suele ser precio final).
+    """
+    if not _linea_es_candidata_material(linea):
+        return []
+
+    precios = _extraer_precios_linea(linea)
+    if not precios:
+        return []
+
+    precio_final = precios[-1]
+
+    # rango de cordura (ajústalo según tu data real)
+    if precio_final <= 0 or precio_final > 100000:
+        return []
+
+    unidad = _detectar_unidad(linea)
+    material = _extraer_material_de_linea(linea)
+
+    # filtros para evitar falsos positivos
+    if len(material) < 4:
+        return []
+    if material.lower().startswith(("s/.", "s/")):
+        return []
+
+    reg = RegistroMaterial(
+        material=material,
+        unidad=unidad,
+        precio=precio_final,
+        moneda="PEN",
+        file_name=file_name,
+        page_number=page_number,
+        fecha_vigencia=fecha_ctx,
+        linea_origen=linea
+    )
+    return [reg]
+
+
+# ============================================================
+# PIPELINE DE EXTRACCIÓN
+# ============================================================
 @st.cache_data(show_spinner=True)
-def cargar_datos(path_json: str) -> pd.DataFrame:
+def construir_df_materiales(path_json: str) -> pd.DataFrame:
     if not os.path.exists(path_json):
         raise FileNotFoundError(f"No se encontró el archivo: {path_json}")
 
@@ -187,146 +315,191 @@ def cargar_datos(path_json: str) -> pd.DataFrame:
 
     archivos = _buscar_lista_archivos(raw)
     if archivos is None:
-        # Mensaje útil para debug
-        tipo = type(raw).__name__
         if isinstance(raw, dict):
-            claves = list(raw.keys())[:20]
             raise ValueError(
-                f"No se encontró una lista de archivos dentro del JSON. "
-                f"Tipo raíz: {tipo}. Claves raíz detectadas: {claves}"
+                "No se encontró lista de archivos en JSON. "
+                f"Claves raíz: {list(raw.keys())[:25]}"
             )
-        raise ValueError(f"No se encontró una lista de archivos dentro del JSON. Tipo raíz: {tipo}")
+        raise ValueError("No se encontró lista de archivos en JSON.")
 
-    filas: List[Dict[str, Any]] = []
+    registros: List[RegistroMaterial] = []
 
     for archivo in archivos:
         if not isinstance(archivo, dict):
             continue
 
-        file_name = archivo.get("file_name", archivo.get("name", "sin_nombre"))
-        file_path = archivo.get("file_path", archivo.get("path", ""))
-        page_count = archivo.get("page_count", archivo.get("num_pages"))
-        sha256 = archivo.get("sha256", "")
+        file_name = str(archivo.get("file_name", archivo.get("name", "sin_nombre")))
+        pages = _obtener_paginas(archivo)
 
-        pages = _obtener_paginas_desde_archivo(archivo)
-
-        # Si no hay pages, igual creamos una fila con texto del archivo completo
+        # si no hay pages, intentamos con el objeto completo como fallback
         if not pages:
-            texto_archivo = _limpiar_y_unir_textos(_extraer_texto_recursivo(archivo))
-            filas.append(
-                {
-                    "file_name": file_name,
-                    "file_path": file_path,
-                    "page_count": page_count,
-                    "sha256": sha256,
-                    "page_number": None,
-                    "texto_pagina": texto_archivo,
-                    "precio_detectado": _extraer_precio_soles(texto_archivo),
-                }
-            )
+            textos = _extraer_textos(archivo)
+            lineas = _split_lineas(textos)
+            fecha_ctx = None
+            for ln in lineas:
+                fecha_ctx = _extraer_fecha_vigencia(ln) or fecha_ctx
+                regs = _parsear_materiales_desde_linea(
+                    linea=ln,
+                    file_name=file_name,
+                    page_number=None,
+                    fecha_ctx=fecha_ctx
+                )
+                registros.extend(regs)
             continue
 
-        # Una fila por página
+        # procesamiento normal por página
         for i, p in enumerate(pages, start=1):
             page_obj = p if isinstance(p, dict) else {"raw_page": p}
-            page_number = _obtener_num_pagina(page_obj, i)
+            page_num = _obtener_num_pagina(page_obj, i)
 
-            texto = _limpiar_y_unir_textos(_extraer_texto_recursivo(page_obj))
-            precio = _extraer_precio_soles(texto)
+            textos = _extraer_textos(page_obj)
+            lineas = _split_lineas(textos)
 
-            filas.append(
-                {
-                    "file_name": file_name,
-                    "file_path": file_path,
-                    "page_count": page_count,
-                    "sha256": sha256,
-                    "page_number": page_number,
-                    "texto_pagina": texto,
-                    "precio_detectado": precio,
-                }
-            )
+            fecha_ctx = None
+            for ln in lineas:
+                fecha_ctx = _extraer_fecha_vigencia(ln) or fecha_ctx
+                regs = _parsear_materiales_desde_linea(
+                    linea=ln,
+                    file_name=file_name,
+                    page_number=page_num,
+                    fecha_ctx=fecha_ctx
+                )
+                registros.extend(regs)
 
-    if not filas:
-        raise ValueError("Se encontró estructura JSON, pero no se pudieron construir filas.")
+    if not registros:
+        raise ValueError(
+            "No se extrajeron materiales. "
+            "Ajusta reglas de parsing (regex/unidades/stopwords) según tu formato OCR."
+        )
 
-    df = pd.DataFrame(filas)
+    df = pd.DataFrame([r.__dict__ for r in registros])
+
+    # limpieza final
+    df["material"] = df["material"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+    df = df[df["material"].str.len() > 3]
+    df = df[df["precio"] > 0]
+
+    # deduplicación básica
+    df = df.drop_duplicates(
+        subset=["material", "unidad", "precio", "file_name", "page_number", "linea_origen"]
+    ).reset_index(drop=True)
+
     return df
 
 
-# =====================================
-# App
-# =====================================
+# ============================================================
+# UI
+# ============================================================
 def main():
-    st.title("🏗 Sistema Inteligente de Costos y Presupuestos")
-    st.caption("Data Maestra: Revista Costos (Agosto 2025 - Marzo 2026)")
+    st.title("🏗️ Sistema Inteligente de Costos y Presupuestos")
+    st.caption("Vista de materiales y precios (no archivos internos).")
 
     try:
-        df = cargar_datos(ARCHIVO_JSON)
+        df = construir_df_materiales(ARCHIVO_JSON)
     except Exception as e:
         st.error(f"Error cargando datos: {e}")
         st.stop()
 
-    # ---------------- Sidebar ----------------
+    # SIDEBAR
     st.sidebar.header("Filtros")
 
-    termino = st.sidebar.text_input(
-        "Buscar material/palabra (en texto de páginas):",
-        value="Ladrillo"
-    ).strip()
+    material_q = st.sidebar.text_input("Buscar material:", value="ladrillo").strip()
 
-    archivos_disponibles = sorted(df["file_name"].dropna().astype(str).unique().tolist())
-    archivos_sel = st.sidebar.multiselect("Filtrar por archivo:", archivos_disponibles, default=[])
+    archivos = sorted(df["file_name"].dropna().unique().tolist())
+    archivos_sel = st.sidebar.multiselect("Filtrar por archivo:", archivos, default=[])
 
-    # ---------------- Filtros ----------------
+    # unidades disponibles
+    unidades = sorted([u for u in df["unidad"].dropna().unique().tolist() if str(u).strip()])
+    unidades_sel = st.sidebar.multiselect("Filtrar por unidad:", unidades, default=[])
+
+    # rango de precio
+    pmin = float(df["precio"].min()) if len(df) else 0.0
+    pmax = float(df["precio"].max()) if len(df) else 100.0
+    rango_precio = st.sidebar.slider(
+        "Rango de precio (S/)",
+        min_value=float(max(0.0, pmin)),
+        max_value=float(max(pmax, pmin + 1.0)),
+        value=(float(max(0.0, pmin)), float(max(pmax, pmin + 1.0))),
+    )
+
+    # FILTRADO
     dff = df.copy()
 
+    if material_q:
+        dff = dff[dff["material"].str.contains(material_q, case=False, na=False)]
+
     if archivos_sel:
-        dff = dff[dff["file_name"].astype(str).isin(archivos_sel)]
+        dff = dff[dff["file_name"].isin(archivos_sel)]
 
-    if termino:
-        dff = dff[dff["texto_pagina"].astype(str).str.contains(termino, case=False, na=False)]
+    if unidades_sel:
+        dff = dff[dff["unidad"].isin(unidades_sel)]
 
-    # ---------------- KPIs ----------------
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Registros filtrados", f"{len(dff):,}")
-    c2.metric("Archivos únicos", f"{dff['file_name'].nunique():,}")
+    dff = dff[(dff["precio"] >= rango_precio[0]) & (dff["precio"] <= rango_precio[1])]
 
-    suma_precios = dff["precio_detectado"].dropna().sum() if "precio_detectado" in dff.columns else 0.0
-    c3.metric("Suma de precios detectados", f"S/ {suma_precios:,.2f}")
+    # KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Registros de materiales", f"{len(dff):,}")
+    c2.metric("Materiales únicos", f"{dff['material'].nunique():,}")
+    c3.metric("Precio promedio", f"S/ {dff['precio'].mean():,.2f}" if len(dff) else "S/ 0.00")
+    c4.metric("Precio mínimo - máximo",
+              f"S/ {dff['precio'].min():,.2f} - S/ {dff['precio'].max():,.2f}" if len(dff) else "S/ 0.00 - 0.00")
 
     st.divider()
 
-    # ---------------- Tabla principal ----------------
-    columnas_default = ["file_name", "page_number", "precio_detectado", "texto_pagina"]
-    columnas_default = [c for c in columnas_default if c in dff.columns]
-
-    columnas_sel = st.multiselect(
-        "Columnas a mostrar:",
-        options=dff.columns.tolist(),
-        default=columnas_default if columnas_default else dff.columns.tolist(),
+    # TABLA DETALLE
+    st.subheader("Detalle de materiales")
+    cols_detalle = [
+        "material", "unidad", "precio", "moneda",
+        "file_name", "page_number", "fecha_vigencia"
+    ]
+    st.dataframe(
+        dff[cols_detalle].sort_values(["material", "precio"], ascending=[True, True]),
+        use_container_width=True,
+        height=450
     )
 
-    mostrar = dff[columnas_sel] if columnas_sel else dff
-    st.dataframe(mostrar.sort_values(by=["file_name", "page_number"], na_position="last"),
-                 use_container_width=True, height=520)
+    # RESUMEN AGRUPADO POR MATERIAL
+    st.subheader("Resumen por material")
+    if len(dff):
+        resumen = (
+            dff.groupby("material", dropna=False)
+            .agg(
+                unidad=("unidad", lambda x: x.dropna().mode().iloc[0] if len(x.dropna()) else None),
+                n_registros=("precio", "count"),
+                precio_min=("precio", "min"),
+                precio_prom=("precio", "mean"),
+                precio_max=("precio", "max"),
+            )
+            .reset_index()
+            .sort_values("precio_prom")
+        )
+        st.dataframe(resumen, use_container_width=True, height=350)
+    else:
+        st.info("No hay resultados con los filtros actuales.")
 
-    # ---------------- Descarga ----------------
-    csv_bytes = dff.to_csv(index=False).encode("utf-8")
+    # DESCARGA
     st.download_button(
-        "⬇️ Descargar resultados CSV",
-        data=csv_bytes,
-        file_name="resultados_filtrados.csv",
+        "⬇️ Descargar detalle CSV",
+        dff.to_csv(index=False).encode("utf-8"),
+        file_name="materiales_detalle.csv",
         mime="text/csv",
     )
 
-    # ---------------- Debug ----------------
-    with st.expander("Debug (estructura)"):
-        st.write("Columnas del DataFrame:")
-        st.write(df.columns.tolist())
-        st.write("Tipos de columnas:")
-        st.write(df.dtypes.astype(str))
-        st.write("Primeras 2 filas:")
-        st.dataframe(df.head(2), use_container_width=True)
+    if len(dff):
+        resumen_csv = resumen.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Descargar resumen CSV",
+            resumen_csv,
+            file_name="materiales_resumen.csv",
+            mime="text/csv",
+        )
+
+    # DEBUG
+    with st.expander("Debug parser"):
+        st.write("Columnas detectadas:", df.columns.tolist())
+        st.write("Muestra de líneas origen:")
+        muestra = dff[["material", "precio", "linea_origen"]].head(10) if len(dff) else df[["material", "precio", "linea_origen"]].head(10)
+        st.dataframe(muestra, use_container_width=True)
 
 
 if __name__ == "__main__":
